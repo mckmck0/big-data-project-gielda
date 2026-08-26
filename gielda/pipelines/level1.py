@@ -63,7 +63,7 @@ class L1Agg(AggregateFunction):
             flash_cnt) -- this is where sum_spread / tick_cnt becomes the
             average.
         """
-        return (acc[0], acc[1], acc[2], acc[3], acc[3] / acc[4] if acc[4] > 0 else 0.0, acc[4], acc[5])
+        return (acc[0], acc[1], acc[2], acc[3] / acc[4] if acc[4] > 0 else 0.0, acc[4], acc[5])
 
     def merge(self, a, b):
         """Merge two partial accumulators (element-wise min/max/sums).

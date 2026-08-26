@@ -10,6 +10,9 @@ from gielda.pipelines.dictionary import DictReader
 from gielda.schemas import DICT_DESC, TICK_TYPE
 from gielda.sources import build_dict_source, build_ticks_source
 from gielda.utils import build_watermarks, parse_tick
+from gielda.pipelines.level1 import build_l1
+from gielda.sinks import attach_l1_sink
+
 
 
 def main():
@@ -35,10 +38,10 @@ def main():
           .process(DictReader(), output_type=Types.STRING())
           .print())
 
-    # TODO(Partia 2): l1 = build_l1(ticks)  (gielda.pipelines.level1)
-    #                 -> keyed JSON sink to cfg["kafka.topic.l1"] via Table API.
+    l1 = build_l1(ticks)
+    attach_l1_sink(env, l1, cfg)
 
-    env.execute("gielda-partia-1")
+    env.execute("gielda-partia-2")
 
 
 if __name__ == "__main__":
