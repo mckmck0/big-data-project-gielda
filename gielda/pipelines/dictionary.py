@@ -1,49 +1,72 @@
-"""Dictionary broadcast: distributes contract definitions to all subtasks.
+"""Dictionary broadcast: enriches level 1 results with contract context.
 
-Partia 1 uses this stage to demonstrate live dictionary reloads on the
-console; in Partia 4 the same broadcast state moves behind the level 1
-window to enrich minute results (as a KeyedBroadcastProcessFunction).
+The compacted topic gielda-kontrakty is read as an unbounded stream and
+broadcast to every subtask, so a running job picks up dictionary changes
+without a restart (Partia 1 criterion, demonstrated end-to-end in Partia 4).
 """
 import json
 
+from pyflink.common import Row
 from pyflink.datastream.functions import BroadcastProcessFunction
 
 from gielda.schemas import DICT_DESC
 
 
-class DictReader(BroadcastProcessFunction):
-    """Joins the tick stream with the broadcast contract dictionary.
+class Enrich(BroadcastProcessFunction):
+    """Enriches level 1 minute results with dictionary context (Partia 4).
 
-    The broadcast side keeps the newest dictionary entry per contractId in
-    broadcast state; the data side does a read-only lookup per tick. A tick
-    whose contract is missing from the dictionary is labelled explicitly
-    instead of failing.
+    Broadcast side maintains the contract dictionary (including deletions
+    via a ``{"deleted": true}`` marker -- the JSON stand-in for a compacted
+    topic's tombstone); data side extends each L1 row with commodity,
+    exchange, currency and lotSizeT. A contract without a dictionary entry
+    yields defaults with ``dict_ok=False`` and a logged warning -- never an
+    exception (graded: no silent NullPointerException).
     """
 
     def process_broadcast_element(self, value, ctx):
-        """Store or update one dictionary entry in the broadcast state.
+        """Apply one dictionary update (upsert or deletion) to the state.
+
+        A malformed dictionary record is logged and skipped -- a poison
+        message on the control stream must not take the pipeline down.
 
         Args:
-            value (str): A JSON string with one contract definition.
+            value (str): JSON with one contract definition, or a deletion
+                marker ``{"contractId": ..., "deleted": true}``.
             ctx (BroadcastProcessFunction.Context): Context with writable
                 broadcast state.
         """
-        d = json.loads(value)
-        ctx.get_broadcast_state(DICT_DESC).put(d['contractId'], value)
-        print(f"[SLOWNIK] aktualizacja: {d['contractId']}")
+        try:
+            d = json.loads(value)
+            state = ctx.get_broadcast_state(DICT_DESC)
+            if d.get('deleted'):
+                state.remove(d['contractId'])
+                print(f"[SLOWNIK] usuniecie wpisu: {d['contractId']}")
+            else:
+                state.put(d['contractId'], value)
+                print(f"[SLOWNIK] aktualizacja: {d['contractId']}")
+        except (ValueError, KeyError, TypeError) as e:
+            print(f"[SLOWNIK][WARN] pominieto niepoprawny rekord slownika: {e}")
 
-    def process_element(self, tick, ctx):
-        """Label one tick with the commodity name from the dictionary.
+    def process_element(self, l1row, ctx):
+        """Extend one L1 row with the four dictionary fields.
 
         Args:
-            tick (Row): A parsed tick.
+            l1row (Row): A level 1 minute result (schemas.L1_TYPE).
             ctx (BroadcastProcessFunction.ReadOnlyContext): Context with
                 read-only broadcast state.
 
         Yields:
-            str: ``"<contractId> <price> [<commodity>]"``; the label is
-            ``BRAK-W-SLOWNIKU`` when the contract has no dictionary entry.
+            Row: One row matching schemas.ENRICHED_TYPE -- the 10 L1 fields
+            followed by commodity, exchange, currency, lot_size_t, dict_ok.
         """
-        entry = ctx.get_broadcast_state(DICT_DESC).get(tick['contractId'])
-        label = json.loads(entry)['commodity'] if entry else 'BRAK-W-SLOWNIKU'
-        yield f"{tick['contractId']} {tick['price']} [{label}]"
+        entry = ctx.get_broadcast_state(DICT_DESC).get(l1row['contractId'])
+        if entry:
+            d = json.loads(entry)
+            yield Row(*l1row, str(d.get('commodity', 'UNKNOWN')),
+                      str(d.get('exchange', 'UNKNOWN')),
+                      str(d.get('currency', 'UNKNOWN')),
+                      float(d.get('lotSizeT', 0.0)), True)
+        else:
+            print(f"[SLOWNIK][WARN] brak wpisu dla {l1row['contractId']} "
+                  f"(okno konczace sie {l1row['win_end']}) - wartosci domyslne")
+            yield Row(*l1row, 'UNKNOWN', 'UNKNOWN', 'UNKNOWN', 0.0, False)
