@@ -8,17 +8,20 @@ splits off before the broadcast connect that freezes them.
 Latency characteristics (grading criteria):
     * immediate alarm  -- filter + map only, no windows/keying/state; delay
       is just the pipeline's processing latency,
-    * pattern alarm    -- fires when the watermark passes a sliding window's
-      end, i.e. window close + the out-of-orderness delay (30 s); that lag
-      is inherent to correctly handling disordered events.
+    * pattern alarm    -- a hand-rolled crawling window (KeyedProcessFunction
+      + ListState of event timestamps): the alarm fires the moment the
+      third flash tick ARRIVES, without waiting for any window to close.
+      This is both faster than a sliding window and faithful to the spec's
+      "any 5 consecutive minutes" (a 1-minute slide would quantize window
+      starts and miss patterns straddling minute boundaries), and it emits
+      ONE alert per episode instead of one per overlapping window.
 """
 import json
 from datetime import datetime, timezone
 
 from pyflink.common import Types
-from pyflink.common.time import Time
-from pyflink.datastream.functions import AggregateFunction, ProcessWindowFunction
-from pyflink.datastream.window import SlidingEventTimeWindows
+from pyflink.datastream.functions import KeyedProcessFunction
+from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
 
 
 def _iso(ms):
@@ -44,53 +47,86 @@ def to_limit_alert(tick):
     })
 
 
-class FlashCount(AggregateFunction):
-    """Incremental count of flash-crash ticks inside one sliding window."""
+class FlashPatternDetector(KeyedProcessFunction):
+    """Alarms when >= threshold flash-crash ticks fall in any 5-minute span.
 
-    def create_accumulator(self):
-        return 0
+    Keyed by contractId; sees only flashCrash ticks. State per key:
+        * ListState of event timestamps observed within the current span,
+        * ValueState flag suppressing duplicate alerts for one episode --
+          it resets once pruning drops the count below the threshold.
 
-    def add(self, tick, acc):
-        return acc + 1
-
-    def get_result(self, acc):
-        return acc
-
-    def merge(self, a, b):
-        return a + b
-
-
-class FlashPatternAlert(ProcessWindowFunction):
-    """Emits an alert when a window's flash-crash count reaches the threshold.
+    Pruning keeps timestamps within (newest - window, newest], so a late
+    (out-of-order) tick still counts toward the pattern -- correctness under
+    disorder comes from using event timestamps, not arrival order. An
+    event-time timer per tick (ts + window) prunes the state when the flash
+    flow stops, so quiet keys do not hold stale state forever.
 
     Args:
-        threshold (int): Minimum flash-crash ticks in the window to alarm.
+        threshold (int): Minimum flash ticks in the span to alarm.
+        window_min (int): Span length in minutes.
     """
 
-    def __init__(self, threshold):
+    def __init__(self, threshold, window_min):
         self.threshold = threshold
+        self.window_ms = window_min * 60 * 1000
+        self.flash_ts = None
+        self.alerted = None
 
-    def process(self, key, ctx, results):
-        """Yield one alert record if the pattern condition holds.
+    def open(self, ctx):
+        """Register the per-key state handles.
 
         Args:
-            key (str): The contractId this window belongs to.
-            ctx (ProcessWindowFunction.Context): Window metadata provider.
-            results (Iterable[int]): Single pre-aggregated count.
+            ctx (RuntimeContext): Flink runtime context.
+        """
+        self.flash_ts = ctx.get_list_state(
+            ListStateDescriptor('flash-ts', Types.LONG()))
+        self.alerted = ctx.get_state(
+            ValueStateDescriptor('alerted', Types.BOOLEAN()))
+
+    def process_element(self, tick, ctx):
+        """Fold one flash tick into the span and alarm on threshold crossing.
+
+        Args:
+            tick (Row): A parsed tick with flashCrash set.
+            ctx (KeyedProcessFunction.Context): Timer service provider.
 
         Yields:
-            str: JSON alert record; nothing when the count is below the
-            threshold (sub-threshold windows produce no output at all).
+            str: JSON alert record, only when the count CROSSES the
+            threshold (one alert per episode, no duplicates).
         """
-        n = next(iter(results))
-        if n >= self.threshold:
+        ts = tick['ts']
+        stamps = list(self.flash_ts.get()) + [ts]
+        newest = max(stamps)
+        stamps = sorted(t for t in stamps if t > newest - self.window_ms)
+        self.flash_ts.update(stamps)
+        ctx.timer_service().register_event_time_timer(ts + self.window_ms)
+
+        if len(stamps) >= self.threshold and not (self.alerted.value() or False):
+            self.alerted.update(True)
             yield json.dumps({
                 'alertType': 'FLASH_CRASH_PATTERN',
-                'contractId': key,
-                'windowStart': _iso(ctx.window().start),
-                'windowEnd': _iso(ctx.window().end),
-                'flashCount': n,
+                'contractId': ctx.get_current_key(),
+                'windowStart': _iso(stamps[0]),
+                'windowEnd': _iso(newest),
+                'flashCount': len(stamps),
             })
+
+    def on_timer(self, timestamp, ctx):
+        """Prune expired timestamps; re-arm alerting once the episode ends.
+
+        Args:
+            timestamp (int): The firing timer's event-time timestamp.
+            ctx (KeyedProcessFunction.OnTimerContext): Timer context.
+        """
+        stamps = [t for t in self.flash_ts.get() if t > timestamp - self.window_ms]
+        if stamps:
+            self.flash_ts.update(stamps)
+            if len(stamps) < self.threshold:
+                self.alerted.update(False)
+        else:
+            self.flash_ts.clear()
+            self.alerted.clear()
+        return iter(())
 
 
 def build_alerts(ticks, cfg):
@@ -110,11 +146,8 @@ def build_alerts(ticks, cfg):
     pattern = (ticks
                .filter(lambda t: t['flashCrash'])
                .key_by(lambda t: t['contractId'], key_type=Types.STRING())
-               .window(SlidingEventTimeWindows.of(
-                   Time.minutes(int(cfg['alert.flash.window.min'])),
-                   Time.minutes(1)))
-               .aggregate(FlashCount(),
-                          window_function=FlashPatternAlert(int(cfg['alert.flash.count'])),
-                          output_type=Types.STRING()))
+               .process(FlashPatternDetector(int(cfg['alert.flash.count']),
+                                             int(cfg['alert.flash.window.min'])),
+                        output_type=Types.STRING()))
 
     return immediate.union(pattern)

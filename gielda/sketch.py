@@ -53,7 +53,14 @@ class LogHistogram:
 
         Args:
             other (LogHistogram): Sketch built with the same alpha.
+
+        Raises:
+            ValueError: If the sketches were built with different alpha
+                (their bucket indices would not be comparable).
         """
+        if other.alpha != self.alpha:
+            raise ValueError(
+                f"nie mozna scalic szkicow o roznym alpha: {self.alpha} != {other.alpha}")
         self.zero_count += other.zero_count
         for i, c in other.buckets.items():
             self.buckets[i] = self.buckets.get(i, 0) + c

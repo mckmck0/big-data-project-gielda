@@ -1,1 +1,4 @@
 gielda/__pycache__/*
+gielda/pipelines/__pycache__/*
+
+*.pyc
