@@ -1,4 +1,4 @@
-"""Testy szkicu kwantylowego (czysty stdlib, bez Flinka).
+"""Testy szkicu kwantylowego.
 
 Uruchomienie z katalogu shared_workspace:
     python3 tests/test_sketch.py
@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gielda.sketch import LogHistogram  # noqa: E402
+from gielda.sketch import LogHistogram
 
 ALPHA = 0.01
 
@@ -77,7 +77,4 @@ if __name__ == "__main__":
             except AssertionError as e:
                 failures += 1
                 print(f"FAIL  {name}: {e}")
-            except NotImplementedError:
-                failures += 1
-                print(f"TODO  {name}: sketch.py jeszcze nie zaimplementowany")
     sys.exit(1 if failures else 0)

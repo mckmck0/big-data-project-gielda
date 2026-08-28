@@ -1,6 +1,6 @@
-"""Entrypoint: wires sources, pipeline stages and sinks into one Flink job.
+"""Sklada caly pipeline gieldy w jeden job Flinka.
 
-Run on the cluster:
+Uruchomienie:
     docker exec flink-jobmanager /opt/flink/bin/flink run -d -py /opt/workspace/main.py
 """
 from pyflink.common import WatermarkStrategy
@@ -17,39 +17,38 @@ from gielda.utils import build_watermarks, parse_tick
 
 
 def main():
-    """Assemble and submit the job."""
     cfg = load_config()
     env = get_flink_env(cfg)
-    # Ship the gielda/ package to the Python UDF workers on the TaskManager.
-    # Must point at the PARENT of the package, not the package itself.
+    # pakiet gielda/ musi trafic na workery Pythona; podajemy RODZICA pakietu
     env.add_python_file("/opt/workspace")
-    print("1. Config loaded, Flink environment set up successfully.")
+    print("[1/6] konfiguracja wczytana, srodowisko Flink skonfigurowane")
 
     ticks = (env.from_source(build_ticks_source(cfg),
                              WatermarkStrategy.no_watermarks(), cfg["kafka.topic.ticks"])
              .flat_map(parse_tick, output_type=TICK_TYPE)
              .assign_timestamps_and_watermarks(build_watermarks(cfg)))
-
     dict_stream = env.from_source(build_dict_source(cfg),
                                   WatermarkStrategy.no_watermarks(), cfg["kafka.topic.dict"])
-    print("2. Sources created, watermarks assigned.")
+    print("[2/6] zrodla Kafka podpiete (ticki + slownik), watermarki ustawione")
 
-    # Partia 2: okna minutowe -> temat posredni (at-least-once, kluczowane).
+    # Partia 2: okna minutowe -> temat posredni (kluczowane, at-least-once)
     l1 = build_l1(ticks)
     attach_l1_sink(env, l1, cfg)
+    print("[3/6] Poziom 1: okna 1-minutowe + sink na temat posredni")
 
-    # Partia 4: wzbogacenie wynikow L1 slownikiem (broadcast, zmienny w locie).
-    # UWAGA: strumien wzbogacony nie ma watermarkow (wejscie broadcast ich nie
-    # emituje) - Poziom 2 nie moze uzywac timerow event-time (dzien w kluczu).
+    # Partia 4: wzbogacenie slownikiem; za broadcastem nie plynie watermark,
+    # wiec dalej nie wolno uzywac timerow event-time (stad dzien w kluczu L2)
     enriched = (l1.connect(dict_stream.broadcast(DICT_DESC))
                   .process(Enrich(), output_type=ENRICHED_TYPE))
+    print("[4/6] wzbogacenie wynikow L1 slownikiem (broadcast)")
 
-    # Partia 5: narastajacy raport dzienny -> finalne ujscie MySQL (upsert).
+    # Partia 5: narastajacy raport dzienny -> MySQL (upsert)
     attach_l2_sink(env, build_l2(enriched), cfg)
+    print("[5/6] Poziom 2: raport dzienny -> MySQL")
 
-    # Partia 6: alarmy z SUROWEGO strumienia (natychmiastowy + licznikowy)
-    # -> temat gielda-alerty (at-least-once = natychmiastowa widocznosc).
+    # Partia 6: alarmy z surowego strumienia -> gielda-alerty
     build_alerts(ticks, cfg).sink_to(build_alerts_sink(cfg))
+    print("[6/6] alarmy podpiete, wysylam job na klaster")
 
     env.execute("gielda-partia-6")
 

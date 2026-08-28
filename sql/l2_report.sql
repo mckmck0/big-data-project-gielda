@@ -27,9 +27,8 @@ CREATE TABLE IF NOT EXISTS l2_report (
     PRIMARY KEY (exchange, session_f, day)
 );
 
--- Przyklad agregacji miedzy dobami bez powrotu do Kafki (uzasadnienie schematu):
+-- Przyklad agregacji miedzy dobami bez powrotu do Kafki:
 --   SELECT exchange, session_f,
 --          SUM(total_volume_t)                          AS wolumen_laczny,
 --          SUM(flash_minutes_cnt) / SUM(minutes_cnt)    AS udzial_flash
 --   FROM l2_report GROUP BY exchange, session_f;
--- (mediane z wielu dob scala sie w Pythonie: LogHistogram.merge na digest_state)

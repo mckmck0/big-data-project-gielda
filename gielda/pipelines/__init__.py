@@ -1,1 +1,1 @@
-"""Processing stages: dictionary broadcast, level 1/2 aggregations, alerts."""
+"""Etapy przetwarzania: poziom 1, slownik, poziom 2, alarmy."""

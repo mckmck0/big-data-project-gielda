@@ -1,20 +1,7 @@
-"""Alerts (Partia 6): immediate limit alarms and the flash-crash pattern.
+"""Alarmy (Partia 6): natychmiastowy (limit up/down) i licznikowy (flash crash).
 
-Both alarms consume the RAW tick stream (not level 1 results): the immediate
-alarm must not wait for any window, and the pattern alarm is defined on
-individual ticks. This branch still carries event-time watermarks -- it
-splits off before the broadcast connect that freezes them.
-
-Latency characteristics (grading criteria):
-    * immediate alarm  -- filter + map only, no windows/keying/state; delay
-      is just the pipeline's processing latency,
-    * pattern alarm    -- a hand-rolled crawling window (KeyedProcessFunction
-      + ListState of event timestamps): the alarm fires the moment the
-      third flash tick ARRIVES, without waiting for any window to close.
-      This is both faster than a sliding window and faithful to the spec's
-      "any 5 consecutive minutes" (a 1-minute slide would quantize window
-      starts and miss patterns straddling minute boundaries), and it emits
-      ONE alert per episode instead of one per overlapping window.
+Obie galezie schodza z surowego strumienia tickow, przed jakakolwiek
+agregacja - ta galaz ma jeszcze watermarki (odgalezia sie przed broadcastem).
 """
 import json
 from datetime import datetime, timezone
@@ -25,19 +12,11 @@ from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
 
 
 def _iso(ms):
-    """Format epoch milliseconds as an ISO-8601 UTC string."""
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
 
 
 def to_limit_alert(tick):
-    """Build the immediate alert record for a limit-up/limit-down tick.
-
-    Args:
-        tick (Row): A parsed tick with limitUp or limitDown set.
-
-    Returns:
-        str: JSON with alert type, key, event time and triggering values.
-    """
+    """Rekord alarmu natychmiastowego: typ, klucz, czas zdarzenia, wartosci wyzwalajace."""
     return json.dumps({
         'alertType': 'LIMIT_UP' if tick['limitUp'] else 'LIMIT_DOWN',
         'contractId': tick['contractId'],
@@ -48,22 +27,10 @@ def to_limit_alert(tick):
 
 
 class FlashPatternDetector(KeyedProcessFunction):
-    """Alarms when >= threshold flash-crash ticks fall in any 5-minute span.
+    """Wlasne okno przesuwne: >= threshold tickow flashCrash w dowolnych window_min minutach.
 
-    Keyed by contractId; sees only flashCrash ticks. State per key:
-        * ListState of event timestamps observed within the current span,
-        * ValueState flag suppressing duplicate alerts for one episode --
-          it resets once pruning drops the count below the threshold.
-
-    Pruning keeps timestamps within (newest - window, newest], so a late
-    (out-of-order) tick still counts toward the pattern -- correctness under
-    disorder comes from using event timestamps, not arrival order. An
-    event-time timer per tick (ts + window) prunes the state when the flash
-    flow stops, so quiet keys do not hold stale state forever.
-
-    Args:
-        threshold (int): Minimum flash ticks in the span to alarm.
-        window_min (int): Span length in minutes.
+    Okno przesuwa sie z kazdym zdarzeniem (nie skokowo co minute), alarm
+    wychodzi natychmiast przy przekroczeniu progu, jeden alarm na epizod.
     """
 
     def __init__(self, threshold, window_min):
@@ -73,34 +40,22 @@ class FlashPatternDetector(KeyedProcessFunction):
         self.alerted = None
 
     def open(self, ctx):
-        """Register the per-key state handles.
-
-        Args:
-            ctx (RuntimeContext): Flink runtime context.
-        """
         self.flash_ts = ctx.get_list_state(
             ListStateDescriptor('flash-ts', Types.LONG()))
         self.alerted = ctx.get_state(
             ValueStateDescriptor('alerted', Types.BOOLEAN()))
 
     def process_element(self, tick, ctx):
-        """Fold one flash tick into the span and alarm on threshold crossing.
-
-        Args:
-            tick (Row): A parsed tick with flashCrash set.
-            ctx (KeyedProcessFunction.Context): Timer service provider.
-
-        Yields:
-            str: JSON alert record, only when the count CROSSES the
-            threshold (one alert per episode, no duplicates).
-        """
         ts = tick['ts']
+        # o przynaleznosci do okna decyduje czas zdarzenia, nie kolejnosc
+        # dotarcia - spozniony tick tez domyka wzorzec
         stamps = list(self.flash_ts.get()) + [ts]
         newest = max(stamps)
         stamps = sorted(t for t in stamps if t > newest - self.window_ms)
         self.flash_ts.update(stamps)
         ctx.timer_service().register_event_time_timer(ts + self.window_ms)
 
+        # flaga tlumi duplikaty w ramach epizodu; zbroi sie ponownie w on_timer
         if len(stamps) >= self.threshold and not (self.alerted.value() or False):
             self.alerted.update(True)
             yield json.dumps({
@@ -112,12 +67,7 @@ class FlashPatternDetector(KeyedProcessFunction):
             })
 
     def on_timer(self, timestamp, ctx):
-        """Prune expired timestamps; re-arm alerting once the episode ends.
-
-        Args:
-            timestamp (int): The firing timer's event-time timestamp.
-            ctx (KeyedProcessFunction.OnTimerContext): Timer context.
-        """
+        # przycina stare znaczniki i czysci stan, gdy anomalie ustana
         stamps = [t for t in self.flash_ts.get() if t > timestamp - self.window_ms]
         if stamps:
             self.flash_ts.update(stamps)
@@ -130,15 +80,7 @@ class FlashPatternDetector(KeyedProcessFunction):
 
 
 def build_alerts(ticks, cfg):
-    """Assemble both alarm streams and union them into one alert stream.
-
-    Args:
-        ticks (DataStream): Parsed ticks with event-time watermarks.
-        cfg (dict): Configuration (alert.flash.count, alert.flash.window.min).
-
-    Returns:
-        DataStream: JSON alert records (both alarm types) as strings.
-    """
+    """Alarm natychmiastowy: goly filter+map (zero stanu i okien). Licznikowy: detektor per kontrakt."""
     immediate = (ticks
                  .filter(lambda t: t['limitUp'] or t['limitDown'])
                  .map(to_limit_alert, output_type=Types.STRING()))

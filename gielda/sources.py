@@ -1,25 +1,10 @@
-"""Kafka source builders.
-
-Both sources deserialize values only -- the record key (contractId) is also
-present inside the JSON payload, so nothing is lost.
-"""
+"""Buildery zrodel Kafka (czytamy same wartosci - klucz rekordu jest tez w JSON-ie)."""
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream.connectors.kafka import KafkaOffsetsInitializer, KafkaSource
 
 
 def build_ticks_source(cfg):
-    """Build the source for the raw tick stream.
-
-    Starts from the earliest offset for reproducible runs during
-    development; on recovery Flink resumes from the offsets stored in the
-    checkpoint, not from this initializer.
-
-    Args:
-        cfg (dict): Configuration parameters.
-
-    Returns:
-        KafkaSource: Source reading raw JSON strings from the tick topic.
-    """
+    """Zrodlo tickow; earliest dziala tylko przy swiezym starcie, po awarii licza sie offsety z checkpointu."""
     return (KafkaSource.builder()
             .set_bootstrap_servers(cfg["kafka.bootstrap.servers"])
             .set_topics(cfg["kafka.topic.ticks"])
@@ -30,19 +15,7 @@ def build_ticks_source(cfg):
 
 
 def build_dict_source(cfg):
-    """Build the source for the contract dictionary topic.
-
-    The topic is compacted and read from the earliest offset as an unbounded
-    stream, so a running job receives both the current dictionary state and
-    every future update -- this is what makes the dictionary reloadable
-    without a restart.
-
-    Args:
-        cfg (dict): Configuration parameters.
-
-    Returns:
-        KafkaSource: Source reading raw JSON dictionary entries.
-    """
+    """Zrodlo slownika: kompaktowany temat czytany bez konca = aktualny stan + przyszle zmiany."""
     return (KafkaSource.builder()
             .set_bootstrap_servers(cfg["kafka.bootstrap.servers"])
             .set_topics(cfg["kafka.topic.dict"])
